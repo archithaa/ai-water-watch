@@ -1,3 +1,4 @@
+import json
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -5,6 +6,296 @@ import folium
 from streamlit_folium import st_folium
 from analysis import load_data, compute_state_summary, compute_monthly_trends, get_sensitivity_data
 from google import genai
+from agent_execute import llm_analyze
+
+
+import plotly.io as pio
+
+pio.templates.default = "simple_white"
+
+# Consistent color palette
+NEUTRAL_PALETTE = [
+    "#1f77b4",  # Policy Blue
+    "#4C72B0",
+    "#6BAED6",
+    "#9ECAE1",
+    "#C6DBEF"
+]
+
+
+# ---------- Helpers for NL -> operations ---------
+import json, re, plotly.express as px
+
+def llm_analyze(q: str, df: pd.DataFrame):
+    client = genai.Client(vertexai=True, project="ai-water-watch-477615", location="us-central1")
+
+    # Send compact context to stay within token limits
+    sample = df.sample(min(len(df), 30), random_state=42).to_dict(orient="records")
+    cols = list(df.columns)
+
+    prompt = f"""
+You are a data analysis assistant. The user asked: "{q}"
+
+Columns: {cols}
+Sample rows (JSON list): {sample}
+
+Return ONLY JSON (no prose) describing the plot to build, like:
+{{
+  "chart": "bar|line|scatter",
+  "groupby": "state" | null,
+  "aggregate": {{"total_water_use_mld": "sum"}} | null,
+  "x": "state|month|data_centers|...",
+  "y": "total_water_use_mld|water_per_center|...",
+  "title": "Human-readable title"
+}}
+"""
+
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[{"role":"user","parts":[{"text": prompt}]}]
+    )
+
+    # --- Parse JSON safely
+    text = (getattr(resp, "output_text", None) or getattr(resp, "text", "") or "").strip()
+    text = re.sub(r"```json|```", "", text).strip()
+    try:
+        plan = json.loads(text)
+    except Exception:
+        raise ValueError(f"LLM did not return valid JSON:\n{text}")
+
+    if not plan:
+        raise Exception("LLM did not return valid plan.")
+
+    chart_type = plan.get("chart", "bar")
+    groupby = plan.get("groupby")
+    agg = plan.get("aggregate") or {}
+    title = plan.get("title", "Result")
+
+    # derive x/y with sane defaults
+    x = plan.get("x")
+    y = plan.get("y")
+
+    # compute table `g`
+    if agg and isinstance(agg, dict):
+        agg_col, agg_func = list(agg.items())[0]
+        if groupby:
+            g = df.groupby(groupby, as_index=False)[agg_col].agg(agg_func)
+        else:
+            g = df[[agg_col]].agg(agg_func).reset_index().rename(columns={"index": groupby or "metric", agg_col: agg_col})
+            if not x: x = groupby or "metric"
+            if not y: y = agg_col
+    else:
+        # no aggregation → try to use original df (limit rows)
+        g = df.copy()
+        if not x or not y:
+            # fallback to a sensible pair if missing
+            x = x or ("month" if "month" in g.columns else "state")
+            y = y or ("total_water_use_mld" if "total_water_use_mld" in g.columns else "data_centers")
+
+    # plot
+    if chart_type == "bar":
+        fig = px.bar(g, x=x, y=y, title=title)
+    elif chart_type == "line":
+        fig = px.line(g, x=x, y=y, title=title)
+    elif chart_type == "scatter":
+        fig = px.scatter(g, x=x, y=y, title=title, trendline=None)
+    else:
+        raise ValueError(f"Unsupported chart type: {chart_type}")
+
+    return title, fig
+
+
+def llm_insight_response(q: str, df: pd.DataFrame) -> str:
+    """Ask Gemini for a plain-language executive reasoning answer using the full dataset."""
+    client = genai.Client(vertexai=True,
+                          project="ai-water-watch-477615",
+                          location="us-central1")
+
+    # Condensed dataset so Gemini can reason safely
+    summary = df.groupby("state", as_index=False).agg({
+        "population_million": "mean",
+        "data_centers": "mean",
+        "total_water_use_mld": "mean",
+        "stress_score": "mean",
+        "water_per_center": "mean"
+    }).round(3)
+
+    prompt = f"""
+You are an environmental & AI infrastructure analyst.
+
+User question:
+"{q}"
+
+Use ONLY this data summary:
+
+{summary.to_string(index=False)}
+
+Provide a concise, decision-focused 4–6 sentence insight.
+No charts. No filler. No repeating the question.
+"""
+
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[{"role":"user", "parts":[{"text": prompt}]}]
+    )
+
+    return resp.text
+
+
+
+def ensure_stress(df0: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee we have a stress_score column, matching your analysis."""
+    df = df0.copy()
+    if "stress_score" not in df.columns:
+        # Derive stress_score using same logic as analysis.py
+        if {"drought_index", "cooling_efficiency", "precipitation_mm"}.issubset(df.columns):
+            import numpy as np
+            df["stress_score"] = (df["drought_index"] * df["cooling_efficiency"]) / np.log1p(df["precipitation_mm"])
+        else:
+            df["stress_score"] = pd.NA
+    return df
+
+CAUSAL_TRIGGERS = {"why", "cause", "causing", "impact of", "due to", "because", "driver", "drivers", "explain", "reason", "lead to", "leads to"}
+PREDICT_TRIGGERS = {"predict", "forecast", "will", "likely", "project", "projection"}
+POLICY_TRIGGERS  = {"should", "recommend", "policy", "regulate", "zoning", "mandate"}
+
+def classify_query_for_flags(q: str) -> dict:
+    ql = q.lower()
+    flags = {
+        "causal": any(w in ql for w in CAUSAL_TRIGGERS),
+        "predictive": any(w in ql for w in PREDICT_TRIGGERS),
+        "policy": any(w in ql for w in POLICY_TRIGGERS),
+    }
+    flags["needs_guardrail"] = any(flags.values())
+    return flags
+def explanatory_stub(df, state_col="state"):
+    # Simple evidence for “why” questions
+    by_state = (df.groupby(state_col, as_index=False)
+                  .agg(drought_index=("drought_index","mean"),
+                       precip=("precipitation_mm","mean"),
+                       cooling=("cooling_efficiency","mean"),
+                       stress=("stress_score","mean"))
+                  .sort_values("stress", ascending=False))
+    msg = (
+        "This is an explanatory *hypothesis*, not causal proof. "
+        "Evidence shown: higher average drought index and/or lower precipitation can co-occur with higher stress. "
+        "Cooling efficiency may moderate stress."
+    )
+    return msg, by_state
+
+
+
+def answer_query_nocode(q: str, df_in: pd.DataFrame):
+    """
+    Tiny rules-based NL router for common governance questions.
+    Returns: (message:str, table:pd.DataFrame|None, fig:plotly.Figure|None, steps:str)
+    """
+    import plotly.express as px
+    df = ensure_stress(df_in)
+    q_low = q.lower().strip()
+    steps = []
+
+    flags = classify_query_for_flags(q)
+    # Causal / “why” guardrail
+    if flags["causal"]:
+        steps.append("Flagged as causal/explanatory → show evidence with hedged language.")
+        msg, table = explanatory_stub(df)
+    
+        fig = px.scatter(
+            table, x="precip", y="stress", size="drought_index",
+            hover_name="state", title="Evidence View: Precipitation vs Stress (Bubble = Drought)"
+        )
+        return msg, table, fig, "\n".join(steps)
+
+    # 1) Row/entry counts
+    if ("how many" in q_low and ("rows" in q_low or "entries" in q_low)) or q_low in {"count rows", "number of rows"}:
+        steps.append("Counted total rows in the dataset.")
+        n = len(df)
+        return f"Total rows: **{n}**", None, None, "\n".join(steps)
+    
+    # 1b) Total number of data centers
+    if ("total" in q_low and "data center" in q_low) or ("how many" in q_low and "data center" in q_low):
+        steps.append("Summed data_centers across dataset.")
+        total = df["data_centers"].sum()
+        return f"Total data centers across all states: **{int(total):,}**", None, None, "\n".join(steps)
+
+    # 2) How many states / list states
+    if ("how many" in q_low and "states" in q_low) or q_low == "states?":
+        steps.append("Computed distinct states.")
+        n = df["state"].nunique()
+        return f"Distinct states: **{n}**", df[["state"]].drop_duplicates().sort_values("state"), None, "\n".join(steps)
+
+    if "list states" in q_low or "which states" in q_low:
+        steps.append("Listed unique states.")
+        return "States present:", df[["state"]].drop_duplicates().sort_values("state"), None, "\n".join(steps)
+
+    # 3) Highest/lowest stress
+    if ("which state" in q_low and ("highest" in q_low or "max" in q_low) and "stress" in q_low):
+        steps.append("Aggregated mean stress_score by state and sorted descending.")
+        g = df.groupby("state", as_index=False)["stress_score"].mean().dropna().sort_values("stress_score", ascending=False)
+        fig = px.bar(g, x="state", y="stress_score", title="Average Water Stress by State (High → Low)")
+        return "Top stressed states (mean stress_score):", g, fig, "\n".join(steps)
+
+    if ("lowest" in q_low and "stress" in q_low):
+        steps.append("Aggregated mean stress_score by state and sorted ascending.")
+        g = df.groupby("state", as_index=False)["stress_score"].mean().dropna().sort_values("stress_score", ascending=True)
+        fig = px.bar(g, x="state", y="stress_score", title="Average Water Stress by State (Low → High)")
+        return "Lowest stressed states:", g, fig, "\n".join(steps)
+
+    # 4) Water scarcity sorting
+    if "water scarcity" in q_low and ("increasing" in q_low or "decreasing" in q_low):
+        steps.append("Interpreted 'water scarcity' as stress_score; sorted descending.")
+        g = df.groupby("state", as_index=False)["stress_score"].mean().dropna().sort_values("stress_score", ascending=False)
+        fig = px.bar(g, x="state", y="stress_score", title="Water Scarcity (Stress) — High → Low")
+        return "Ordered by scarcity (stress):", g, fig, "\n".join(steps)
+
+    # 5) Time trends
+    if "trend" in q_low or "over time" in q_low or "monthly" in q_low:
+        steps.append("Summed total_water_use_mld by month to plot trend.")
+        if "month" in df.columns and "total_water_use_mld" in df.columns:
+            t = df.copy()
+            t["month"] = pd.to_datetime(t["month"], errors="coerce")
+            g = t.groupby("month", as_index=False)["total_water_use_mld"].sum().dropna()
+            fig = px.line(g, x="month", y="total_water_use_mld", title="Total Water Use Over Time", markers=True)
+            return "Monthly total water use:", g, fig, "\n".join(steps)
+
+    # 6) Fallback → Check if question is explanatory / causal
+flags = classify_query_for_flags(q)
+if flags["causal"] or flags["predictive"] or flags["policy"]:
+    steps.append("Routed to reasoning mode (causal/policy/predictive detected).")
+    try:
+        insight = llm_insight_response(q, df)
+        return insight, None, None, "\n".join(steps)
+    except Exception as e:
+        steps.append(f"Insight mode failed: {e}")
+
+# 7) Fallback → Gemini chart planner
+steps.append("No rule matched → attempting Gemini chart planner")
+try:
+    answer, fig = llm_analyze(q, df)
+    return answer, None, fig, "\n".join(steps)
+except Exception as e:
+    steps.append(f"Chart planner failed: {e}")
+
+# 8) Final fallback → Explanation LLM (text-only)
+steps.append("Trying general reasoning fallback (text insight).")
+try:
+    insight = llm_insight_response(q, df)
+    return insight, None, None, "\n".join(steps)
+except Exception as e:
+    steps.append(f"Insight fallback also failed: {e}")
+    cols = ", ".join(df.columns)
+    return (
+        f"I couldn’t interpret that. Try instead:\n"
+        "- *How many rows?*\n"
+        "- *Which state has highest water stress?*\n"
+        "- *Show monthly trend of total water use.*\n\n"
+        f"Columns available: {cols}",
+        None,
+        None,
+        "\n".join(steps)
+    )
+
 
 # ==============================
 # STREAMLIT CONFIG
@@ -31,6 +322,9 @@ summary = compute_state_summary(df)
 monthly = compute_monthly_trends(df)
 sensitivity = get_sensitivity_data(df)
 
+if "water_per_center" not in df.columns:
+    df["water_per_center"] = df["total_water_use_mld"] / df["data_centers"]
+
 # ==============================
 # ADD LAT/LON IF MISSING
 # ==============================
@@ -48,11 +342,12 @@ if 'latitude' not in df.columns or 'longitude' not in df.columns:
 # ==============================
 # TABS
 # ==============================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "State Overview",
     "Trends",
     "Map View",
-    "Policy Insights"
+    "Policy Insights",
+    "Ask Your Data"
 ])
 
 # ==============================
@@ -85,13 +380,14 @@ with tab1:
         st.caption("Shows total water withdrawal relative to stress levels in each state.")
 
     with col2:
-        st.markdown("#### ⚖️ Water Efficiency vs Stress")
+        st.markdown("#### Water Efficiency vs Stress")
         fig2 = px.scatter(
             summary,
             x="water_per_center",
             y="stress_score",
             size="population_million",
             color="state",
+            color_discrete_sequence=NEUTRAL_PALETTE,
             hover_name="state",
             title="Water Efficiency vs Stress"
         )
@@ -111,6 +407,7 @@ with tab2:
             monthly,
             x="month",
             y="total_water_use_mld",
+            color_discrete_sequence=["#1f77b4"],
             title="Total Water Use Over Time",
             markers=True,
         )
@@ -122,7 +419,7 @@ with tab2:
             monthly,
             x="month",
             y="water_per_center",
-            color_discrete_sequence=["green"],
+            color_discrete_sequence=["#4C72B0"],
             title="Water Use per Center (Trend)"
         )
         st.plotly_chart(fig4, width='stretch')
@@ -131,15 +428,17 @@ with tab2:
     # --- Sensitivity Chart ---
     st.markdown("#### Water Stress per Million People")
     sensitivity["stress_per_million"] = sensitivity["stress_score"] / sensitivity["population_million"]
-
+    
     fig5 = px.bar(
         sensitivity,
         x="state",
         y="stress_per_million",
         color="state",
+        color_discrete_sequence=NEUTRAL_PALETTE,
         labels={"stress_per_million": "Water Stress per Million People", "state": "State"},
         title="Comparative Water Stress Index (Population-Adjusted)"
     )
+    fig5.update_yaxes(range=[0, sensitivity["stress_per_million"].max() * 1.2])
     st.plotly_chart(fig5, width='stretch')
     st.caption("Normalizes stress relative to population, making cross-state comparison clearer.")
 
@@ -166,24 +465,44 @@ with tab3:
 # ==============================
 # GEMINI — POLICY INSIGHTS
 # ==============================
-def generate_policy_insights(prompt_text):
+def generate_policy_insights(prompt_text: str) -> str:
+    """Calls Gemini safely across both signature versions. Returns short summary."""
     try:
-        client = genai.Client(
-            vertexai=True,
-            project="ai-water-watch-477615",
-            location="us-central1"
-        )
+        client = genai.Client(vertexai=True, project="ai-water-watch-477615", location="us-central1")
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[{
-                "role": "user",
-                "parts": [{"text": prompt_text}]
-            }],
-            config={"max_output_tokens": 250, "temperature": 0.4}
-        )
+        contents = [{
+            "role": "user",
+            "parts": [{
+                "text": (
+                    "Write a brief McKinsey-style executive summary (<=120 words) "
+                    "on AI data-center growth and water stress, based ONLY on this context: "
+                    f"{prompt_text}"
+                )
+            }]
+        }]
 
-        return response.text
+        # Try newer-style config first
+        try:
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config={"max_output_tokens": 150, "temperature": 0.3}
+            )
+        except TypeError:
+            # Fallback for older signature (no config/params)
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents
+            )
+
+        # Extract text robustly across client versions
+        text = getattr(resp, "output_text", None) or getattr(resp, "text", None)
+        if not text and getattr(resp, "candidates", None):
+            parts = getattr(resp.candidates[0].content, "parts", []) or []
+            text = "".join(getattr(p, "text", "") for p in parts).strip()
+
+        return (text or "No model text returned.").strip()
+
     except Exception as e:
         return f"⚠️ Gemini API call failed: {e}"
 
@@ -195,35 +514,58 @@ with tab4:
     st.write("Generating AI-driven policy insights using Gemini...")
 
     if not summary.empty:
-        top_state = summary.loc[summary['stress_score'].idxmax(), 'state']
-        avg_stress = round(summary['stress_score'].mean(), 3)
-        avg_water = round(summary['total_water_use_mld'].mean(), 2)
-        summary_stats = summary.describe().to_string()
+        top = summary.sort_values("stress_score", ascending=False).head(1)
+        low = summary.sort_values("stress_score", ascending=True).head(1)
 
         prompt_text = (
-            f"Analyze this dataset on AI data centers and water stress across U.S. states. "
-            f"The most stressed state is {top_state}, with an average stress score of {avg_stress}. "
-            f"Average total water use across states is {avg_water} MLD.\n\n"
-            f"Here are summary statistics:\n{summary_stats}\n\n"
-            "Write a concise McKinsey-style executive summary "
-            "linking AI infrastructure growth, population pressure, and water sustainability."
+            f"States analyzed: {', '.join(summary['state'].tolist())}. "
+            f"Highest stress: {top.iloc[0]['state']} (score {top.iloc[0]['stress_score']:.2f}). "
+            f"Lowest stress: {low.iloc[0]['state']} (score {low.iloc[0]['stress_score']:.2f}). "
+            f"Mean water use (MLD): {summary['total_water_use_mld'].mean():.0f}. "
+            f"Mean water/center: {summary['water_per_center'].mean():.1f}. "
+            f"Mean population (M): {summary['population_million'].mean():.1f}."
         )
 
         insights = generate_policy_insights(prompt_text)
 
-        if not insights or len(insights.strip()) < 50:
+        # Fallback if Gemini returns nothing useful
+        if not insights or len(insights.strip()) < 40:
             insights = (
-                f"Among the analyzed states, **{top_state}** faces the highest water stress. "
-                f"Future AI infrastructure expansion should prioritize water-efficient cooling systems "
-                f"and integrate regional hydrological planning. "
-                f"Average water use across states ({avg_water} MLD) underscores the need "
-                f"for sustainability metrics in digital infrastructure development."
+                f"**{top.iloc[0]['state']}** currently shows the highest water stress, while "
+                f"**{low.iloc[0]['state']}** appears more resilient. "
+                f"Variation in water-per-center (avg {summary['water_per_center'].mean():.1f} MLD) "
+                f"suggests location-specific cooling efficiency strategies are required."
             )
 
-        st.markdown("###  Executive Summary")
+        st.markdown("### Executive Summary")
         st.write(insights)
+
     else:
         st.info("Please upload or load data first to generate policy insights.")
+
+
+
+# ==============================
+# TAB 5 — ASK YOUR DATA (Conversational analytics)
+# ==============================
+with tab5:
+    st.subheader("Ask Your Data (natural language)")
+    st.caption("Type a question. I’ll run the operation and show a chart/table when possible.")
+
+    q = st.text_input("Your question", placeholder="e.g., Which state has highest water stress?")
+    if st.button("Run", type="primary"):
+        if not df.empty:
+            msg, table, fig, steps = answer_query_nocode(q, df)
+            st.markdown(f"**Answer:** {msg}")
+            if table is not None and not table.empty:
+                st.dataframe(table, width='stretch')
+            if fig is not None:
+                st.plotly_chart(fig, width='stretch', key=f"ask_chart_{hash(q)}")
+            with st.expander("Show steps (how I interpreted your question)"):
+                st.code(steps)
+        else:
+            st.info("Please upload or load data first.")
+
 
 # ==============================
 # FOOTER
