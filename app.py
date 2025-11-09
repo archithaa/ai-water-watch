@@ -260,41 +260,42 @@ def answer_query_nocode(q: str, df_in: pd.DataFrame):
             return "Monthly total water use:", g, fig, "\n".join(steps)
 
     # 6) Fallback → Check if question is explanatory / causal
-flags = classify_query_for_flags(q)
-if flags["causal"] or flags["predictive"] or flags["policy"]:
-    steps.append("Routed to reasoning mode (causal/policy/predictive detected).")
+    flags = classify_query_for_flags(q)
+    if flags["causal"] or flags["predictive"] or flags["policy"]:
+        steps.append("Routed to reasoning mode (causal/policy/predictive detected).")
+        try:
+            insight = llm_insight_response(q, df)
+            return insight, None, None, "\n".join(steps)
+        except Exception as e:
+            steps.append(f"Insight mode failed: {e}")
+
+    # 7) Fallback → Gemini chart planner
+    steps.append("No rule matched → attempting Gemini chart planner")
+    try:
+        answer, fig = llm_analyze(q, df)
+        return answer, None, fig, "\n".join(steps)
+    except Exception as e:
+        steps.append(f"Chart planner failed: {e}")
+
+    # 8) Final fallback → Explanation-only LLM
+    steps.append("Trying general reasoning fallback (text insight).")
     try:
         insight = llm_insight_response(q, df)
         return insight, None, None, "\n".join(steps)
     except Exception as e:
-        steps.append(f"Insight mode failed: {e}")
+        steps.append(f"Insight fallback also failed: {e}")
+        cols = ", ".join(df.columns)
+        return (
+            f"I couldn’t interpret that. Try instead:\n"
+            "- *How many rows?*\n"
+            "- *Which state has highest water stress?*\n"
+            "- *Show monthly trend of total water use.*\n\n"
+            f"Columns available: {cols}",
+            None,
+            None,
+            "\n".join(steps)
+        )
 
-# 7) Fallback → Gemini chart planner
-steps.append("No rule matched → attempting Gemini chart planner")
-try:
-    answer, fig = llm_analyze(q, df)
-    return answer, None, fig, "\n".join(steps)
-except Exception as e:
-    steps.append(f"Chart planner failed: {e}")
-
-# 8) Final fallback → Explanation LLM (text-only)
-steps.append("Trying general reasoning fallback (text insight).")
-try:
-    insight = llm_insight_response(q, df)
-    return insight, None, None, "\n".join(steps)
-except Exception as e:
-    steps.append(f"Insight fallback also failed: {e}")
-    cols = ", ".join(df.columns)
-    return (
-        f"I couldn’t interpret that. Try instead:\n"
-        "- *How many rows?*\n"
-        "- *Which state has highest water stress?*\n"
-        "- *Show monthly trend of total water use.*\n\n"
-        f"Columns available: {cols}",
-        None,
-        None,
-        "\n".join(steps)
-    )
 
 
 # ==============================
