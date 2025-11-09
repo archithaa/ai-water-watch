@@ -168,6 +168,7 @@ def classify_query_for_flags(q: str) -> dict:
     }
     flags["needs_guardrail"] = any(flags.values())
     return flags
+
 def explanatory_stub(df, state_col="state"):
     # Simple evidence for “why” questions
     by_state = (df.groupby(state_col, as_index=False)
@@ -183,118 +184,88 @@ def explanatory_stub(df, state_col="state"):
     )
     return msg, by_state
 
-
-
 def answer_query_nocode(q: str, df_in: pd.DataFrame):
-    """
-    Tiny rules-based NL router for common governance questions.
-    Returns: (message:str, table:pd.DataFrame|None, fig:plotly.Figure|None, steps:str)
-    """
     import plotly.express as px
     df = ensure_stress(df_in)
     q_low = q.lower().strip()
     steps = []
 
     flags = classify_query_for_flags(q)
-    # Causal / “why” guardrail
+
+    # --- 0) Causal guardrail (FIXED: now returns)
     if flags["causal"]:
         steps.append("Flagged as causal/explanatory → show evidence with hedged language.")
         msg, table = explanatory_stub(df)
-    
         fig = px.scatter(
             table, x="precip", y="stress", size="drought_index",
             hover_name="state", title="Evidence View: Precipitation vs Stress (Bubble = Drought)"
         )
         return msg, table, fig, "\n".join(steps)
 
-    # 1) Row/entry counts
+    # 1) Row count
     if ("how many" in q_low and ("rows" in q_low or "entries" in q_low)) or q_low in {"count rows", "number of rows"}:
         steps.append("Counted total rows in the dataset.")
-        n = len(df)
-        return f"Total rows: **{n}**", None, None, "\n".join(steps)
-    
-    # 1b) Total number of data centers
-    if ("total" in q_low and "data center" in q_low) or ("how many" in q_low and "data center" in q_low):
+        return f"Total rows: **{len(df)}**", None, None, "\n".join(steps)
+
+    # 1b) TOTAL DATA CENTERS (FIXED SPELLINGS)
+    if any(phrase in q_low for phrase in [
+        "data center", "data centers", "datacenter",
+        "data centre", "data centres"
+    ]):
         steps.append("Summed data_centers across dataset.")
         total = df["data_centers"].sum()
         return f"Total data centers across all states: **{int(total):,}**", None, None, "\n".join(steps)
 
-    # 2) How many states / list states
+    # 2) Distinct states
     if ("how many" in q_low and "states" in q_low) or q_low == "states?":
         steps.append("Computed distinct states.")
-        n = df["state"].nunique()
-        return f"Distinct states: **{n}**", df[["state"]].drop_duplicates().sort_values("state"), None, "\n".join(steps)
+        return f"Distinct states: **{df['state'].nunique()}**", df[["state"]].drop_duplicates().sort_values("state"), None, "\n".join(steps)
 
     if "list states" in q_low or "which states" in q_low:
         steps.append("Listed unique states.")
         return "States present:", df[["state"]].drop_duplicates().sort_values("state"), None, "\n".join(steps)
 
-    # 3) Highest/lowest stress
+    # 3) Stress comparisons
     if ("which state" in q_low and ("highest" in q_low or "max" in q_low) and "stress" in q_low):
         steps.append("Aggregated mean stress_score by state and sorted descending.")
         g = df.groupby("state", as_index=False)["stress_score"].mean().dropna().sort_values("stress_score", ascending=False)
-        fig = px.bar(g, x="state", y="stress_score", title="Average Water Stress by State (High → Low)")
-        return "Top stressed states (mean stress_score):", g, fig, "\n".join(steps)
+        return "Top stressed states (mean stress_score):", g, px.bar(g, x="state", y="stress_score"), "\n".join(steps)
 
     if ("lowest" in q_low and "stress" in q_low):
         steps.append("Aggregated mean stress_score by state and sorted ascending.")
         g = df.groupby("state", as_index=False)["stress_score"].mean().dropna().sort_values("stress_score", ascending=True)
-        fig = px.bar(g, x="state", y="stress_score", title="Average Water Stress by State (Low → High)")
-        return "Lowest stressed states:", g, fig, "\n".join(steps)
+        return "Lowest stressed states:", g, px.bar(g, x="state", y="stress_score"), "\n".join(steps)
 
-    # 4) Water scarcity sorting
-    if "water scarcity" in q_low and ("increasing" in q_low or "decreasing" in q_low):
-        steps.append("Interpreted 'water scarcity' as stress_score; sorted descending.")
-        g = df.groupby("state", as_index=False)["stress_score"].mean().dropna().sort_values("stress_score", ascending=False)
-        fig = px.bar(g, x="state", y="stress_score", title="Water Scarcity (Stress) — High → Low")
-        return "Ordered by scarcity (stress):", g, fig, "\n".join(steps)
-
-    # 5) Time trends
+    # 4) Trends
     if "trend" in q_low or "over time" in q_low or "monthly" in q_low:
         steps.append("Summed total_water_use_mld by month to plot trend.")
-        if "month" in df.columns and "total_water_use_mld" in df.columns:
-            t = df.copy()
-            t["month"] = pd.to_datetime(t["month"], errors="coerce")
-            g = t.groupby("month", as_index=False)["total_water_use_mld"].sum().dropna()
-            fig = px.line(g, x="month", y="total_water_use_mld", title="Total Water Use Over Time", markers=True)
-            return "Monthly total water use:", g, fig, "\n".join(steps)
+        t = df.copy()
+        t["month"] = pd.to_datetime(t["month"], errors="coerce")
+        g = t.groupby("month", as_index=False)["total_water_use_mld"].sum().dropna()
+        return "Monthly total water use:", g, px.line(g, x="month", y="total_water_use_mld", markers=True), "\n".join(steps)
 
-    # 6) Fallback → Check if question is explanatory / causal
-    flags = classify_query_for_flags(q)
-    if flags["causal"] or flags["predictive"] or flags["policy"]:
+    # 5) Reasoning mode
+    if flags["predictive"] or flags["policy"]:
         steps.append("Routed to reasoning mode (causal/policy/predictive detected).")
-        try:
-            insight = llm_insight_response(q, df)
-            return insight, None, None, "\n".join(steps)
-        except Exception as e:
-            steps.append(f"Insight mode failed: {e}")
+        return llm_insight_response(q, df), None, None, "\n".join(steps)
 
-    # 7) Fallback → Gemini chart planner
+    # 6) Gemini Chart Planner
     steps.append("No rule matched → attempting Gemini chart planner")
     try:
         answer, fig = llm_analyze(q, df)
         return answer, None, fig, "\n".join(steps)
-    except Exception as e:
-        steps.append(f"Chart planner failed: {e}")
+    except:
+        pass
 
-    # 8) Final fallback → Explanation-only LLM
-    steps.append("Trying general reasoning fallback (text insight).")
-    try:
-        insight = llm_insight_response(q, df)
-        return insight, None, None, "\n".join(steps)
-    except Exception as e:
-        steps.append(f"Insight fallback also failed: {e}")
-        cols = ", ".join(df.columns)
-        return (
-            f"I couldn’t interpret that. Try instead:\n"
-            "- *How many rows?*\n"
-            "- *Which state has highest water stress?*\n"
-            "- *Show monthly trend of total water use.*\n\n"
-            f"Columns available: {cols}",
-            None,
-            None,
-            "\n".join(steps)
-        )
+    # 7) Final text fallback
+    cols = ", ".join(df.columns)
+    return (
+        f"I couldn’t interpret that. Try:\n"
+        "- *Which state has highest water stress?*\n"
+        "- *Show monthly trend of total water use.*\n\n"
+        f"Columns available: {cols}",
+        None, None, "\n".join(steps)
+    )
 
 
 
@@ -463,86 +434,62 @@ with tab3:
     st_folium(m, width=700)
     st.caption("Circle size reflects relative water stress intensity per state.")
 
-# ==============================
-# GEMINI — POLICY INSIGHTS
-# ==============================
-def generate_policy_insights(prompt_text: str) -> str:
-    """Calls Gemini safely across both signature versions. Returns short summary."""
-    try:
-        client = genai.Client(vertexai=True, project="ai-water-watch-477615", location="us-central1")
-
-        contents = [{
-            "role": "user",
-            "parts": [{
-                "text": (
-                    "Write a brief McKinsey-style executive summary (<=120 words) "
-                    "on AI data-center growth and water stress, based ONLY on this context: "
-                    f"{prompt_text}"
-                )
-            }]
-        }]
-
-        # Try newer-style config first
-        try:
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=contents,
-                config={"max_output_tokens": 150, "temperature": 0.3}
-            )
-        except TypeError:
-            # Fallback for older signature (no config/params)
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=contents
-            )
-
-        # Extract text robustly across client versions
-        text = getattr(resp, "output_text", None) or getattr(resp, "text", None)
-        if not text and getattr(resp, "candidates", None):
-            parts = getattr(resp.candidates[0].content, "parts", []) or []
-            text = "".join(getattr(p, "text", "") for p in parts).strip()
-
-        return (text or "No model text returned.").strip()
-
-    except Exception as e:
-        return f"⚠️ Gemini API call failed: {e}"
 
 # ==============================
 # TAB 4 — POLICY INSIGHTS
 # ==============================
 with tab4:
     st.header("Executive Summary — AI & Water Sustainability")
-    st.write("Generating AI-driven policy insights using Gemini...")
+    st.write("Generate decision-oriented insights summarizing the dataset.")
 
-    if not summary.empty:
-        top = summary.sort_values("stress_score", ascending=False).head(1)
-        low = summary.sort_values("stress_score", ascending=True).head(1)
+    # ✅ Instantiate Gemini client here
+    client = genai.Client(
+        vertexai=True,
+        project="ai-water-watch-477615",
+        location="us-central1"
+    )
 
-        prompt_text = (
-            f"States analyzed: {', '.join(summary['state'].tolist())}. "
-            f"Highest stress: {top.iloc[0]['state']} (score {top.iloc[0]['stress_score']:.2f}). "
-            f"Lowest stress: {low.iloc[0]['state']} (score {low.iloc[0]['stress_score']:.2f}). "
-            f"Mean water use (MLD): {summary['total_water_use_mld'].mean():.0f}. "
-            f"Mean water/center: {summary['water_per_center'].mean():.1f}. "
-            f"Mean population (M): {summary['population_million'].mean():.1f}."
-        )
+    if st.button("Generate Policy Insight", type="primary"):
 
-        insights = generate_policy_insights(prompt_text)
+        summary = df.groupby("state", as_index=False).agg({
+            "population_million": "mean",
+            "data_centers": "mean",
+            "total_water_use_mld": "mean",
+            "stress_score": "mean",
+            "water_per_center": "mean"
+        }).round(3)
 
-        # Fallback if Gemini returns nothing useful
-        if not insights or len(insights.strip()) < 40:
-            insights = (
-                f"**{top.iloc[0]['state']}** currently shows the highest water stress, while "
-                f"**{low.iloc[0]['state']}** appears more resilient. "
-                f"Variation in water-per-center (avg {summary['water_per_center'].mean():.1f} MLD) "
-                f"suggests location-specific cooling efficiency strategies are required."
+        context = summary.to_string(index=False)
+
+        insight_prompt = f"""
+        You are an environmental policy analyst.
+        Produce a concise decision-grade summary (<=120 words).
+        Avoid hype. Avoid speculation. Do not invent numbers.
+
+        Dataset Summary:
+        {context}
+        """
+
+        try:
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[{"role": "user", "parts": [{"text": insight_prompt}]}]
             )
 
-        st.markdown("### Executive Summary")
-        st.write(insights)
+            text = getattr(resp, "output_text", None) or getattr(resp, "text", None)
+            if not text and hasattr(resp, "candidates"):
+                parts = resp.candidates[0].content.parts
+                text = "".join(getattr(p, "text", "") for p in parts)
+
+            st.markdown("### Executive Summary")
+            st.write(text.strip() if text else "No insight returned.")
+
+        except Exception as e:
+            st.error(f"⚠️ Policy insight failed: {e}")
 
     else:
-        st.info("Please upload or load data first to generate policy insights.")
+        st.info("Click **Generate Policy Insight** to analyze the data.")
+
 
 
 
@@ -550,7 +497,7 @@ with tab4:
 # TAB 5 — ASK YOUR DATA (Conversational analytics)
 # ==============================
 with tab5:
-    st.subheader("Ask Your Data (natural language)")
+    st.subheader("Ask Your Data")
     st.caption("Type a question. I’ll run the operation and show a chart/table when possible.")
 
     q = st.text_input("Your question", placeholder="e.g., Which state has highest water stress?")
