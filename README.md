@@ -41,15 +41,15 @@
 ## **Repository Structure**
 ai-water-watch/
 
-├── app.py # Streamlit UI + NL query reasoning + policy summaries
+├── app.py                          # Streamlit UI + NL query reasoning + policy summaries
 
-├── analysis.py # Shared analytics logic
+├── analysis.py                     # Shared analytics logic
 
-├── agent_execute.py # Gemini chart planner executor
+├── agent_execute.py                # Gemini chart planner executor
 
-├── generate_data.py # Synthetic dataset generator (300 rows/monthly variation)
+├── generate_data.py                # Synthetic dataset generator (300 rows/monthly variation)
 
-├── water_5states_300rows.csv # Sample dataset
+├── water_5states_300rows.csv       # Sample dataset
 
 ├── requirements.txt
 
@@ -62,12 +62,13 @@ ai-water-watch/
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
-
+```
 ## **Google Cloud Shell (recommended)**
+```bash
 pip install -r requirements.txt
 gcloud services enable aiplatform.googleapis.com
 streamlit run app.py --server.port 8080 --server.enableCORS false --server.enableXsrfProtection false
-
+```
 ## **Limitations (POC Stage)**
 
 * Uses synthetic hydrology and AI Center data.
@@ -81,5 +82,5 @@ streamlit run app.py --server.port 8080 --server.enableCORS false --server.enabl
 * Host as public Streamlit Cloud / Cloud Run app
 * Add unit tests for NLQ routing
 
-Built by Architha
-During the Google Gemini CLI Workshop at Meetup, hosted at IBM.
+*Built by Architha A Murthy*
+*During the Google Gemini CLI Workshop at Meetup, hosted at IBM.*
