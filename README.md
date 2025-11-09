@@ -40,12 +40,19 @@
 
 ## **Repository Structure**
 ai-water-watch/
+
 ├── app.py # Streamlit UI + NL query reasoning + policy summaries
+
 ├── analysis.py # Shared analytics logic
+
 ├── agent_execute.py # Gemini chart planner executor
+
 ├── generate_data.py # Synthetic dataset generator (300 rows/monthly variation)
+
 ├── water_5states_300rows.csv # Sample dataset
+
 ├── requirements.txt
+
 └── README.md
 
 
