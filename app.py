@@ -477,9 +477,12 @@ with tab4:
             )
 
             text = getattr(resp, "output_text", None) or getattr(resp, "text", None)
-            if not text and hasattr(resp, "candidates"):
-                parts = resp.candidates[0].content.parts
-                text = "".join(getattr(p, "text", "") for p in parts)
+            
+            if not text and hasattr(resp, "candidates") and resp.candidates:
+                parts = getattrs(resp.candidates[0].content, "parts", [])
+                text = "".join([getattr(p, "text", "") for p in parts if hasattr(p, "text")])
+            
+            text = text.strip() if text else "No insight returned."
 
             st.markdown("### Executive Summary")
             st.write(text.strip() if text else "No insight returned.")
